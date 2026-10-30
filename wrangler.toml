@@ -1,3 +1,12 @@
+name = "sira-jobs"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+
+[vars]
+ADMIN_ID = "1267336367"
+CHANNEL_ID = "@test_channel"
+BRAND_NAME = "Sira Jobs"
+
 [[d1_databases]]
 binding = "jobs_db"
 database_name = "DB"
