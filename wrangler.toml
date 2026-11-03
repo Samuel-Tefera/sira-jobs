@@ -4,7 +4,7 @@ compatibility_date = "2026-10-01"
 
 [vars]
 ADMIN_ID = "1267336367"
-CHANNEL_ID = "@test_channel"
+CHANNEL_ID = "-1003800789539"
 BRAND_NAME = "Sira Jobs"
 
 [[d1_databases]]
