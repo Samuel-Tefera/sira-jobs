@@ -25,7 +25,12 @@ app.post("/telegram/webhook", (c) => {
 
 app.get("/telegram/set-webhook", async (c) => {
   const bot = createBot(c.env);
-  const webhookUrl = new URL("/telegram/webhook", c.req.url).toString();
+
+  const url = new URL(c.req.url);
+  url.protocol = "https:";
+  url.pathname = "/telegram/webhook";
+
+  const webhookUrl = url.toString();
 
   await bot.api.setWebhook(webhookUrl, {
     secret_token: c.env.WEBHOOK_SECRET || undefined,
