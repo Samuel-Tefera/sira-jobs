@@ -1,9 +1,17 @@
-import { Bot, InlineKeyboard } from "grammy";
-import { getConfig } from "./config";
-import { createJob } from "./services/jobs";
-import type { Env } from "./type";
+import { Bot, InlineKeyboard, type Context } from "grammy";
+import { getConfig, type AppConfig } from "./config";
+import {
+  claimJobForApproval,
+  createJob,
+  getJobById,
+  rejectJob,
+  resetJobToPending,
+  setJobChannelMessageId,
+} from "./services/jobs";
+import type { Env, Job } from "./type";
 
 const MAX_PREVIEW_LENGTH = 3500;
+const MAX_CHANNEL_TEXT_LENGTH = 3800;
 
 export function createBot(env: Env): Bot {
   const config = getConfig(env);
@@ -82,9 +90,15 @@ export function createBot(env: Env): Bot {
       return;
     }
 
-    await ctx.answerCallbackQuery({
-      text: "Approve/reject actions are not implemented yet.",
-    });
+    const [, action, jobIdText] = ctx.match as RegExpMatchArray;
+    const jobId = Number(jobIdText);
+
+    try {
+      await handleJobDecision(bot, env, config, ctx, action, jobId);
+    } catch (error) {
+      console.error(`Failed to process job #${jobId} (${action}):`, error);
+      await answerCallbackSafely(ctx, "Something went wrong. Please try again.", true);
+    }
   });
 
   bot.on("callback_query:data", async (ctx) => {
@@ -132,6 +146,156 @@ async function notifyAdmin(
   } catch (error) {
     console.error(`Failed to notify admin (job #${jobId}):`, error);
   }
+}
+
+async function handleJobDecision(
+  bot: Bot,
+  env: Env,
+  config: AppConfig,
+  ctx: Context,
+  action: string,
+  jobId: number
+): Promise<void> {
+  const job = await getJobById(env.jobs_db, jobId);
+  if (!job) {
+    await ctx.answerCallbackQuery({
+      text: `Job #${jobId} could not be found.`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  if (job.status !== "pending") {
+    await removeReviewButtons(ctx);
+    await ctx.answerCallbackQuery({
+      text: `Job #${job.id} was already ${job.status}.`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  if (action === "reject") {
+    const rejected = await rejectJob(env.jobs_db, job.id);
+    if (!rejected) {
+      await removeReviewButtons(ctx);
+      await ctx.answerCallbackQuery({
+        text: `Job #${job.id} was already processed.`,
+        show_alert: true,
+      });
+      return;
+    }
+
+    await removeReviewButtons(ctx);
+    await notifySender(bot, job, "rejected", config.brandName);
+    await answerCallbackSafely(ctx, `Job #${job.id} rejected.`);
+    await replySafely(ctx, `❌ Job #${job.id} was rejected. The sender has been notified.`);
+    return;
+  }
+
+  // Claim the job first so two quick clicks cannot publish it twice.
+  const claimed = await claimJobForApproval(env.jobs_db, job.id);
+  if (!claimed) {
+    await removeReviewButtons(ctx);
+    await ctx.answerCallbackQuery({
+      text: `Job #${job.id} was already processed.`,
+      show_alert: true,
+    });
+    return;
+  }
+
+  let channelMessageId: number;
+  try {
+    const channelMessage = await bot.api.sendMessage(
+      config.channelId,
+      buildChannelPost(job, config.brandName),
+      { parse_mode: "HTML" }
+    );
+    channelMessageId = channelMessage.message_id;
+  } catch (error) {
+    console.error(`Failed to publish job #${job.id} to channel:`, error);
+
+    try {
+      await resetJobToPending(env.jobs_db, job.id);
+    } catch (resetError) {
+      console.error(`Failed to reset job #${job.id} to pending:`, resetError);
+    }
+
+    await ctx.answerCallbackQuery({
+      text: "Could not publish to the channel. Check that the bot is an admin in the channel and CHANNEL_ID is correct, then try again.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  try {
+    await setJobChannelMessageId(env.jobs_db, job.id, channelMessageId);
+  } catch (error) {
+    console.error(`Job #${job.id} was published but its channel message ID was not saved:`, error);
+  }
+
+  await removeReviewButtons(ctx);
+  await notifySender(bot, job, "approved", config.brandName);
+  await answerCallbackSafely(ctx, `Job #${job.id} approved and published.`);
+  await replySafely(ctx, `✅ Job #${job.id} was published to the channel. The sender has been notified.`);
+}
+
+async function answerCallbackSafely(
+  ctx: Context,
+  text: string,
+  showAlert = false
+): Promise<void> {
+  try {
+    await ctx.answerCallbackQuery({ text, show_alert: showAlert });
+  } catch (error) {
+    console.error("Failed to answer callback query:", error);
+  }
+}
+
+async function replySafely(ctx: Context, text: string): Promise<void> {
+  try {
+    await ctx.reply(text);
+  } catch (error) {
+    console.error("Failed to send admin confirmation:", error);
+  }
+}
+
+async function removeReviewButtons(ctx: Context): Promise<void> {
+  try {
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined });
+  } catch (error) {
+    console.error("Failed to remove review buttons:", error);
+  }
+}
+
+async function notifySender(
+  bot: Bot,
+  job: Job,
+  decision: "approved" | "rejected",
+  brandName: string
+): Promise<void> {
+  const message =
+    decision === "approved"
+      ? `✅ Good news! Your job submission #${job.id} has been approved and published on the ${brandName} channel.`
+      : `❌ Your job submission #${job.id} was reviewed but could not be approved for publishing. Please check the requirements and try again.`;
+
+  try {
+    await bot.api.sendMessage(job.employer_chat_id, message);
+  } catch (error) {
+    console.error(`Failed to notify the sender of job #${job.id}:`, error);
+  }
+}
+
+function buildChannelPost(job: Job, brandName: string): string {
+  const description = job.formatted_en?.trim() || job.raw_text.trim();
+  const body = truncateHtml(escapeHtml(description), MAX_CHANNEL_TEXT_LENGTH);
+
+  return [
+    "🚀 <b>New Job Opportunity</b>",
+    "",
+    body,
+    "",
+    `📢 <b>${escapeHtml(brandName)}</b>`,
+  ].join("\n");
 }
 
 function escapeHtml(value: string): string {
