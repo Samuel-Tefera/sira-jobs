@@ -32,6 +32,9 @@ export interface Env {
   CHANNEL_ID: string;
   BRAND_NAME: string;
 
+  GEMINI_API_KEY: string;
+  GEMINI_MODEL?: string;
+
   WEBHOOK_SECRET?: string;
 
   jobs_db: D1Database;
