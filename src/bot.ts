@@ -1,5 +1,7 @@
 import { Bot, InlineKeyboard, type Context } from "grammy";
 import { getConfig, type AppConfig } from "./config";
+import { analyzeJobPost, type JobExtraction } from "./services/ai/ai";
+import { toGregorianDeadline } from "./services/ai/deadline";
 import {
   claimJobForApproval,
   createJob,
@@ -7,11 +9,19 @@ import {
   rejectJob,
   resetJobToPending,
   setJobChannelMessageId,
+  updateJobWithAiFields,
 } from "./services/jobs";
 import type { Env, Job } from "./type";
 
 const MAX_PREVIEW_LENGTH = 3500;
 const MAX_CHANNEL_TEXT_LENGTH = 3800;
+
+const MAX_AI_FIELD_LENGTH = 100;
+const MAX_AI_REQUIREMENT_LENGTH = 80;
+const MAX_AI_DETAILS_LENGTH = 300;
+const MAX_AI_APPLY_LENGTH = 400;
+const MAX_AI_SCAM_LENGTH = 200;
+const MAX_AI_POST_LENGTH = 2400;
 
 export function createBot(env: Env): Bot {
   const config = getConfig(env);
@@ -67,7 +77,17 @@ export function createBot(env: Env): Bot {
       return;
     }
 
-    await notifyAdmin(bot, job.id, rawText, ctx.chat.id, employerUsername, config.adminId);
+    const extraction = await extractJobForAdmin(env, job.id, rawText);
+
+    await notifyAdmin(
+      bot,
+      job.id,
+      rawText,
+      extraction,
+      ctx.chat.id,
+      employerUsername,
+      config.adminId
+    );
 
     await ctx.reply(
       `✅ Job submission #${job.id} received.\n\n` +
@@ -108,31 +128,60 @@ export function createBot(env: Env): Bot {
   return bot;
 }
 
+async function extractJobForAdmin(
+  env: Env,
+  jobId: number,
+  rawText: string
+): Promise<JobExtraction | null> {
+  try {
+    const extraction = await analyzeJobPost(env, rawText);
+
+    if (extraction.is_job_post) {
+      await updateJobWithAiFields(env.jobs_db, jobId, {
+        title: extraction.title,
+        company: extraction.company,
+        location: extraction.location,
+        category: extraction.category,
+        deadline: toGregorianDeadline(extraction.deadline_date, extraction.calendar),
+        apply_info: extraction.apply_info,
+        formatted_en: extraction.formatted_en,
+        formatted_am: extraction.formatted_am,
+        scam_flag: extraction.scam.suspicious
+          ? extraction.scam.reasons.join("; ") || "AI marked this post as suspicious"
+          : null,
+      });
+    }
+
+    return extraction;
+  } catch (error) {
+    console.error(`AI extraction failed for job #${jobId}:`, error);
+    return null;
+  }
+}
+
 async function notifyAdmin(
   bot: Bot,
   jobId: number,
   rawText: string,
+  extraction: JobExtraction | null,
   employerChatId: number,
   employerUsername: string | null,
   adminId: number
 ): Promise<void> {
-  const preview = truncateHtml(escapeHtml(rawText), MAX_PREVIEW_LENGTH);
-
   const employerLabel = employerUsername
     ? `@${escapeHtml(employerUsername)}`
     : "no username";
 
-  const message = [
-    `🆕 <b>New job submission #${jobId}</b>`,
-    "",
-    `<b>From:</b> ${employerLabel}`,
-    `<b>Chat ID:</b> <code>${employerChatId}</code>`,
-    "",
-    "<b>Raw description</b>",
-    `<blockquote>${preview}</blockquote>`,
-    "",
-    "Use the buttons below to moderate this submission.",
-  ].join("\n");
+  const message =
+    extraction?.is_job_post
+      ? buildStructuredAdminMessage(jobId, extraction, employerLabel, employerChatId)
+      : buildRawAdminMessage(
+          jobId,
+          rawText,
+          employerLabel,
+          employerChatId,
+          extraction
+        );
 
   const keyboard = new InlineKeyboard()
     .text("✅ Approve", `job:approve:${jobId}`)
@@ -146,6 +195,126 @@ async function notifyAdmin(
   } catch (error) {
     console.error(`Failed to notify admin (job #${jobId}):`, error);
   }
+}
+
+function buildRawAdminMessage(
+  jobId: number,
+  rawText: string,
+  employerLabel: string,
+  employerChatId: number,
+  extraction: JobExtraction | null
+): string {
+  const preview = truncateHtml(escapeHtml(rawText), MAX_PREVIEW_LENGTH);
+
+  const lines = [
+    `🆕 <b>New job submission #${jobId}</b>`,
+    "",
+    `<b>From:</b> ${employerLabel}`,
+    `<b>Chat ID:</b> <code>${employerChatId}</code>`,
+    "",
+  ];
+
+  if (extraction) {
+    lines.push("⚠️ <b>AI note:</b> This does not look like a job post.");
+  } else {
+    lines.push("⚠️ <b>AI extraction failed.</b> Showing the raw submission.");
+  }
+
+  lines.push(
+    "",
+    "<b>Raw description</b>",
+    `<blockquote>${preview}</blockquote>`,
+    "",
+    "Use the buttons below to moderate this submission."
+  );
+
+  return lines.join("\n");
+}
+
+function buildStructuredAdminMessage(
+  jobId: number,
+  extraction: JobExtraction,
+  employerLabel: string,
+  employerChatId: number
+): string {
+  const deadline = toGregorianDeadline(extraction.deadline_date, extraction.calendar);
+  const deadlineText = extraction.deadline_raw
+    ? `${formatField(extraction.deadline_raw)}${deadline ? ` → <code>${deadline}</code>` : ""}`
+    : formatField(null);
+
+  const lines = [
+    `🆕 <b>New job submission #${jobId}</b>`,
+    "",
+    `<b>From:</b> ${employerLabel}`,
+    `<b>Chat ID:</b> <code>${employerChatId}</code>`,
+    "",
+    "🤖 <b>AI extracted data</b>",
+    `<b>Title:</b> ${formatField(extraction.title)}`,
+    `<b>Company:</b> ${formatField(extraction.company)}`,
+    `<b>Location:</b> ${formatField(extraction.location)}`,
+    `<b>Category:</b> ${formatField(extraction.category)}`,
+    `<b>Language:</b> ${extraction.language === "am" ? "Amharic" : "English"}`,
+    `<b>Deadline:</b> ${deadlineText}`,
+    `<b>Scam check:</b> ${formatScam(extraction.scam)}`,
+  ];
+
+  if (extraction.formatted_en) {
+    lines.push(
+      "",
+      "<b>Channel post (EN)</b>",
+      `<blockquote>${truncateHtml(
+        escapeHtml(extraction.formatted_en),
+        MAX_AI_POST_LENGTH
+      )}</blockquote>`
+    );
+  } else {
+    if (extraction.requirements.length > 0) {
+      lines.push("", "<b>Requirements</b>");
+      for (const requirement of extraction.requirements.slice(0, 8)) {
+        lines.push(
+          `• ${truncateHtml(escapeHtml(requirement), MAX_AI_REQUIREMENT_LENGTH)}`
+        );
+      }
+    }
+
+    if (extraction.details) {
+      lines.push(
+        "",
+        "<b>Details</b>",
+        truncateHtml(escapeHtml(extraction.details), MAX_AI_DETAILS_LENGTH)
+      );
+    }
+
+    if (extraction.apply_info) {
+      lines.push(
+        "",
+        "<b>Apply info</b>",
+        `<blockquote>${truncateHtml(
+          escapeHtml(extraction.apply_info),
+          MAX_AI_APPLY_LENGTH
+        )}</blockquote>`
+      );
+    }
+  }
+
+  lines.push("", "Use the buttons below to moderate this submission.");
+
+  return lines.join("\n");
+}
+
+function formatField(value: string | null): string {
+  return value
+    ? truncateHtml(escapeHtml(value), MAX_AI_FIELD_LENGTH)
+    : "<i>not stated</i>";
+}
+
+function formatScam(scam: JobExtraction["scam"]): string {
+  if (!scam.suspicious) {
+    return "✅ no scam signals";
+  }
+
+  const reasons = scam.reasons.join("; ") || "marked as suspicious";
+  return `⚠️ ${truncateHtml(escapeHtml(reasons), MAX_AI_SCAM_LENGTH)}`;
 }
 
 async function handleJobDecision(
