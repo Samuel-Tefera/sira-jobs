@@ -24,6 +24,7 @@
   },
   "homepage": "https://github.com/Samuel-Tefera/sira-jobs#readme",
   "dependencies": {
+    "@google/genai": "^2.32.0",
     "grammy": "^1.46.0",
     "hono": "^4.13.13"
   },
