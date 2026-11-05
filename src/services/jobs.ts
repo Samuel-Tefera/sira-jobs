@@ -30,6 +30,45 @@ export async function getJobById(db: D1Database, jobId: number): Promise<Job | n
   return db.prepare("SELECT * FROM jobs WHERE id = ?").bind(jobId).first<Job>();
 }
 
+export interface JobAiFields {
+  title: string | null;
+  company: string | null;
+  location: string | null;
+  category: string | null;
+  deadline: string | null;
+  apply_info: string | null;
+  formatted_en: string | null;
+  formatted_am: string | null;
+  scam_flag: string | null;
+}
+
+export async function updateJobWithAiFields(
+  db: D1Database,
+  jobId: number,
+  fields: JobAiFields
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE jobs
+       SET title = ?, company = ?, location = ?, category = ?, deadline = ?,
+           apply_info = ?, formatted_en = ?, formatted_am = ?, scam_flag = ?
+       WHERE id = ? AND status = 'pending'`
+    )
+    .bind(
+      fields.title,
+      fields.company,
+      fields.location,
+      fields.category,
+      fields.deadline,
+      fields.apply_info,
+      fields.formatted_en,
+      fields.formatted_am,
+      fields.scam_flag,
+      jobId
+    )
+    .run();
+}
+
 // Marks a pending job as approved before it is posted to the channel.
 // Returns false when the job was already processed by another click.
 export async function claimJobForApproval(db: D1Database, jobId: number): Promise<boolean> {
