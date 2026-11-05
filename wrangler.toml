@@ -6,6 +6,7 @@ compatibility_date = "2026-10-01"
 ADMIN_ID = "1267336367"
 CHANNEL_ID = "-1003800789539"
 BRAND_NAME = "Sira Jobs"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 [[d1_databases]]
 binding = "jobs_db"
